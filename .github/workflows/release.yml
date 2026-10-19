@@ -1,13 +1,27 @@
 name: Release
 
+# Startet bei einem Tag wie v4.0.1:
+#   git tag v4.0.1 && git push origin v4.0.1
+#
+# Wichtig für mehrere parallele Ports: Ein Tag hängt am **Commit**, nicht am Branch.
+# Wer auf dem Branch `26.3` einen Tag setzt und pusht, released genau diesen Stand —
+# ein Merge nach `main` ist dafür nicht nötig. Der Trigger `tags: ['v*']` feuert
+# unabhängig davon, von welchem Branch aus gepusht wurde.
+#
+# Der Tag ist die einzige Wahrheit für die Versionsnummer: Das führende "v" wird
+# abgestreift und der Rest per -Pmod_version=... an Gradle übergeben. Damit landen Tag,
+# JAR-Name (trinkets-<version>.jar) und die Version in fabric.mod.json immer
+# automatisch übereinander — gradle.properties muss vorher NICHT angefasst werden.
 on:
-  release:
-    types:
-      - published
+  push:
+    tags: ['v*']
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
 
     steps:
@@ -20,7 +34,9 @@ jobs:
           key: gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: |
             gradle-
-      - uses: actions/checkout@v4
+
+      - name: Checkout
+        uses: actions/checkout@v4
 
       # JDK 26: gradle/gradle-daemon-jvm.properties verlangt toolchainVersion=26,
       # kompiliert wird mit release=25 (siehe build.gradle).
@@ -30,19 +46,78 @@ jobs:
           distribution: temurin
           java-version: '26'
 
+      - name: Gradle einrichten
+        uses: gradle/actions/setup-gradle@v4
+
+      # Der Tag liefert die Basisversion, aus gradle.properties die Ziel-Minecraft-Version.
+      # Beides zusammen wird ausgeliefert: 4.0.1+mc26.3. Bei workflow_dispatch (kein Tag)
+      # bleibt es bei der Version aus gradle.properties.
+      - name: Version aus Tag und gradle.properties ableiten
+        id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::Tag $GITHUB_REF_NAME sieht nicht wie vX.Y.Z aus (z. B. v4.0.1)."
+              exit 1
+            fi
+            MC="$(sed -n 's/^minecraft_version=//p' gradle.properties)"
+            if [ -z "$MC" ]; then
+              echo "::error::minecraft_version fehlt in gradle.properties."
+              exit 1
+            fi
+            FULL="${VERSION}+mc${MC}"
+          else
+            FULL="$(sed -n 's/^mod_version *= *//p' gradle.properties)"
+            if [ -z "$FULL" ]; then
+              echo "::error::mod_version fehlt in gradle.properties."
+              exit 1
+            fi
+          fi
+          echo "value=$FULL" >> "$GITHUB_OUTPUT"
+          echo "Release-Version: $FULL"
+
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
-      - name: Build and publish with Gradle
-        run: ./gradlew build publishMods publish
+
+      - name: Build
+        run: ./gradlew build -Pmod_version="${{ steps.version.outputs.value }}"
+
+      # Legt das GitHub-Release mit automatisch erzeugten Release-Notes an und hängt
+      # die Mod-JAR an (Sources-JAR bleibt außen vor). Titel = Tag plus MC-Suffix.
+      - name: GitHub-Release anlegen
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "v${{ steps.version.outputs.value }}" \
+            --generate-notes \
+            build/libs/trinkets-${{ steps.version.outputs.value }}.jar
+
+      # Changelog für Modrinth/CurseForge: Release-Body, falls vorhanden.
+      - name: Changelog ermitteln
+        id: changelog
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            BODY="$(gh release view "$GITHUB_REF_NAME" --json body -q .body 2>/dev/null || true)"
+          else
+            BODY=""
+          fi
+          {
+            echo "body<<EOF_CHANGELOG"
+            echo "$BODY"
+            echo "EOF_CHANGELOG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish to Modrinth / CurseForge / Maven
+        run: ./gradlew publishMods publish -Pmod_version="${{ steps.version.outputs.value }}"
         env:
           MAVEN_URL: ${{ secrets.MAVEN_URL }}
           MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
           MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
           MODRINTH: ${{ secrets.MODRINTH }}
           CURSEFORGE: ${{ secrets.CURSEFORGE }}
-          CHANGELOG: ${{ github.event.release.body }}
-      - name: Upload GitHub release
-        uses: AButler/upload-release-assets@v3.0
-        with:
-          files: 'build/libs/*.jar;!build/libs/*-sources.jar;!build/libs/*-dev.jar'
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          CHANGELOG: ${{ steps.changelog.outputs.body }}
