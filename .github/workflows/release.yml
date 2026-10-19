@@ -21,10 +21,14 @@ jobs:
           restore-keys: |
             gradle-
       - uses: actions/checkout@v4
+
+      # JDK 26: gradle/gradle-daemon-jvm.properties verlangt toolchainVersion=26,
+      # kompiliert wird mit release=25 (siehe build.gradle).
       - name: Set up JDK
-        uses: actions/setup-java@v1
+        uses: actions/setup-java@v4
         with:
-          java-version: 25
+          distribution: temurin
+          java-version: '26'
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
